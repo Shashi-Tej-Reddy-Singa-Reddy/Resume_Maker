@@ -4,7 +4,6 @@
 // older versions; new resume data is never written to localStorage.
 class FolioPersistence {
   constructor({normalize, onStatus, onRecovered, notify}) {
-    this.revision = null;
     Object.assign(this,{normalize,onStatus,onRecovered,notify});
     this.revision=null;this.generation=0;this.pending=false;this.diskOK=false;
     this.running=false;this.timer=null;this.sources=[];this.location='data/';
