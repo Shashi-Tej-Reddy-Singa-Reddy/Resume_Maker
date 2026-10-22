@@ -32,6 +32,9 @@ class PersistenceTests(unittest.TestCase):
         reloaded = WorkspaceStore(self.temporary.name).load()
         self.assertEqual(reloaded['workspace'], expected)
         self.assertEqual(reloaded['revision'], saved['revision'])
+        folder_copy = Path(self.temporary.name) / 'workspace.json'
+        self.assertEqual(json.loads(folder_copy.read_text()), expected)
+        self.assertEqual(reloaded['storage']['directory'], str(Path(self.temporary.name).resolve()))
         backup = sqlite3.connect(Path(self.temporary.name) / 'workspace.backup.sqlite3')
         try:
             self.assertEqual(json.loads(backup.execute('SELECT body FROM snapshots ORDER BY sequence DESC LIMIT 1').fetchone()[0]), expected)

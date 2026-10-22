@@ -30,6 +30,8 @@ const persistence = new FolioPersistence({
     storageFailed = state.unsafe;
     $('#save-state').textContent = state.text;
     $('#save-state').classList.toggle('unsaved', state.pending);
+    $('#storage-path').textContent = state.directory;
+    $('#folder-save-warning').hidden = !state.error;
   },
   onRecovered: value => {
     workspace = value;
@@ -329,6 +331,7 @@ $('#try-demo').onclick=()=>{
 };
 window.addEventListener('beforeunload',event=>{if(storageFailed){event.preventDefault();event.returnValue='';}});
 $('#profiles-dialog').addEventListener('cancel',event=>{if(!current)event.preventDefault();});
+$('#storage-error-dialog').addEventListener('cancel',event=>event.preventDefault());
 const mobileSettings = document.createElement('button');
 mobileSettings.className='button secondary small';
 mobileSettings.textContent='⚙';
@@ -346,7 +349,8 @@ async function initializeWorkspace() {
   } catch(error) {
     storageFailed = true;
     $('#save-state').textContent = 'Recovery failed · export a backup';
-    toast('Could not restore the workspace. Your stored copies have been preserved. Reload or restore a backup.',true);
+    $('#startup-error-message').textContent = error.message;
+    showDialog('#storage-error-dialog');
   } finally { document.body.inert = false; }
 }
 initializeWorkspace();

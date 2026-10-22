@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -52,7 +53,33 @@ class WorkspaceStore:
         # Keep a separate consistent database copy, including any committed WAL entries.
         with self.lock:
             with self.connect() as connection:
+                state = self.read(connection)
                 self.backup(connection)
+                if state['workspace'] is not None:
+                    self.publish_json(state['workspace'])
+
+    def publish_json(self, workspace):
+        """Publish a readable folder copy using an atomic, flushed replacement."""
+        descriptor, temporary = tempfile.mkstemp(prefix='.workspace-', suffix='.tmp', dir=self.directory)
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                json.dump(workspace, stream, ensure_ascii=False, indent=2)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.directory / 'workspace.json')
+            directory_fd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def location(self):
+        return {'directory': str(self.directory.resolve()), 'database': str(self.path.resolve()),
+                'json': str((self.directory / 'workspace.json').resolve())}
 
     @contextmanager
     def connect(self):
@@ -95,7 +122,7 @@ class WorkspaceStore:
 
     def load(self):
         with self.lock, self.connect() as connection:
-            return self.read(connection)
+            return {**self.read(connection), 'storage': self.location()}
 
     def save(self, workspace, base_revision):
         value = validate_workspace(workspace)
@@ -111,6 +138,11 @@ class WorkspaceStore:
                                (revision, body, hashlib.sha256(body.encode()).hexdigest(), saved_at))
             connection.execute('DELETE FROM snapshots WHERE sequence NOT IN (SELECT sequence FROM snapshots ORDER BY sequence DESC LIMIT 100)')
             connection.commit()
+            folder_copy = True
+            try:
+                self.publish_json(value)
+            except OSError:
+                folder_copy = False
             # Failure to refresh the secondary backup must not misreport a committed save.
             try:
                 if state['workspace'] is None:
@@ -118,4 +150,4 @@ class WorkspaceStore:
                 self.backup(connection)
             except (OSError, sqlite3.Error):
                 pass
-            return {'revision': revision, 'savedAt': saved_at}
+            return {'revision': revision, 'savedAt': saved_at, 'folderCopy': folder_copy, 'storage': self.location()}

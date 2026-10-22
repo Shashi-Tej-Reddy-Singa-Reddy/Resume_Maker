@@ -1,198 +1,137 @@
 'use strict';
 
-// Browser writes are immediate. Server writes are serialized and acknowledged only
-// after the SQLite transaction commits. Each tab has its own durable pending copy.
+// The local server is the source of truth. Browser storage is read only to migrate
+// older versions; new resume data is never written to localStorage.
 class FolioPersistence {
   constructor({normalize, onStatus, onRecovered, notify}) {
-    this.normalize = normalize;
-    this.onStatus = onStatus;
-    this.onRecovered = onRecovered;
-    this.notify = notify;
-    this.key = 'folio.persistence.v2';
-    this.outboxPrefix = 'folio.pending.';
-    this.outbox = this.outboxPrefix + crypto.randomUUID();
     this.revision = null;
-    this.generation = 0;
-    this.pending = false;
-    this.browserOK = true;
-    this.diskOK = false;
-    this.running = false;
-    this.timer = null;
-    this.recoveredKeys = [];
+    Object.assign(this,{normalize,onStatus,onRecovered,notify});
+    this.revision=null;this.generation=0;this.pending=false;this.diskOK=false;
+    this.running=false;this.timer=null;this.sources=[];this.location='data/';
   }
-
   document(value) {
-    return JSON.parse(JSON.stringify({version:1, activeId:value.activeId || null, profiles:value.profiles}));
+    return JSON.parse(JSON.stringify({version:1,activeId:value.activeId || null,profiles:value.profiles}));
   }
-
-  same(left, right) {
-    const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value==='object' ? Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])) : value;
+  same(left,right) {
+    const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
     return JSON.stringify(canonical(left))===JSON.stringify(canonical(right));
   }
-
   report() {
-    this.onStatus({
-      unsafe: this.pending && !this.browserOK,
-      text: !this.pending && this.diskOK ? 'Saved to disk' : this.browserOK ? 'Saved in browser · disk pending' : 'Not saved · export a backup',
-      pending: this.pending || !this.diskOK,
-    });
+    this.onStatus({unsafe:this.pending,pending:this.pending,error:!this.diskOK,
+      text:!this.diskOK?'Not saved to folder · reconnect':this.pending?'Saving to local folder…':'Saved to local folder',
+      directory:this.location});
   }
-
-  cache() {
-    const record = JSON.stringify({workspace:this.latest, revision:this.revision, dirty:this.pending});
-    let written = false;
-    try {
-      if (this.pending) { localStorage.setItem(this.outbox, record); written = true; }
-      else localStorage.removeItem(this.outbox);
-    } catch (_) { /* A full browser store must not prevent a disk save. */ }
-    try { localStorage.setItem(this.key, record); written = true; } catch (_) { /* Report below. */ }
-    this.browserOK = written;
-    this.report();
-  }
-
-  merge(remote, local) {
-    const merged = this.document(remote);
-    for (const entry of local.profiles) {
-      const existing = merged.profiles.find(p => p.id === entry.id);
-      if (existing && this.same(existing,entry)) continue;
-      const recovered = JSON.parse(JSON.stringify(entry));
-      if (existing) recovered.id = crypto.randomUUID();
+  merge(remote,local) {
+    const merged=this.document(remote);
+    for(const entry of local.profiles){
+      const existing=merged.profiles.find(p=>p.id===entry.id);
+      if(existing&&this.same(existing,entry))continue;
+      const recovered=JSON.parse(JSON.stringify(entry));
+      if(existing)recovered.id=crypto.randomUUID();
       merged.profiles.push(recovered);
-      if (local.activeId === entry.id) merged.activeId = recovered.id;
+      if(local.activeId===entry.id)merged.activeId=recovered.id;
     }
-    if (!merged.profiles.some(p => p.id === merged.activeId)) merged.activeId = merged.profiles[0]?.id || null;
+    if(!merged.profiles.some(p=>p.id===merged.activeId))merged.activeId=merged.profiles[0]?.id || null;
     return merged;
   }
-
   async start() {
-    const empty = {version:1, activeId:null, profiles:[]};
-    let cached = null;
-    const interrupted = [];
-    let unreadable = false;
+    const response=await fetch('/api/workspace',{cache:'no-store',signal:AbortSignal.timeout(10000)});
+    if(!response.ok)throw new Error('Local directory storage is unavailable. Restart the server and retry.');
+    const state=await response.json();
+    this.latest=state.workspace?this.normalize(state.workspace):{version:1,activeId:null,profiles:[]};
+    this.revision=state.revision;this.diskOK=true;
+    this.location=state.storage?.directory || 'data/';
+    let recovered=false;
+    const candidates=[];
+    // Migration only: preserve existing data from the former browser-based app.
     try {
-      const raw = localStorage.getItem(this.key);
-      if (raw) {
-        try { cached = JSON.parse(raw); cached.workspace = this.normalize(cached.workspace); }
-        catch (_) { unreadable = true; cached = null; }
-      }
-      if (!cached) {
-        const legacy = localStorage.getItem('folio.workspace.v1');
-        if (legacy) {
-          try { cached = {workspace:this.normalize(JSON.parse(legacy)),revision:null,dirty:true}; }
-          catch (_) { unreadable = true; }
-        }
-      }
-      for (let i=0;i<localStorage.length;i++) {
-        const key = localStorage.key(i);
-        if (!key.startsWith(this.outboxPrefix)) continue;
+      const raw=localStorage.getItem('folio.persistence.v2');
+      if(raw){
         try {
-          const record = JSON.parse(localStorage.getItem(key));
-          record.workspace = this.normalize(record.workspace);
-          if (record.dirty) interrupted.push({key, raw:localStorage.getItem(key), ...record});
-        } catch (_) { unreadable = true; }
+          const record=JSON.parse(raw);
+          if(record.dirty||state.workspace===null)candidates.push({key:'folio.persistence.v2',raw,...record});
+        }catch(_){this.notify('Old browser data could not be imported. Your folder data is available; the old browser copy was preserved.');}
+      }else if(state.workspace===null){
+        const legacy=localStorage.getItem('folio.workspace.v1');
+        if(legacy)candidates.push({key:'folio.workspace.v1',raw:legacy,workspace:JSON.parse(legacy),revision:null});
       }
-    } catch (_) { this.browserOK = false; }
-    this.latest = this.document(cached?.workspace || empty);
-    this.revision = cached?.revision || null;
-    this.pending = !!cached?.dirty;
-    let recovered = false;
-    for (const record of interrupted) {
-      this.recoveredKeys.push({key:record.key,raw:record.raw});
-      if (!this.same(record.workspace,this.latest)) {
-        this.latest = this.merge(this.latest,record.workspace);
-        recovered = true;
+      for(let i=0;i<localStorage.length;i++){
+        const key=localStorage.key(i);
+        if(!key?.startsWith('folio.pending.'))continue;
+        try {
+          const raw=localStorage.getItem(key);const record=JSON.parse(raw);
+          if(record.dirty)candidates.push({key,raw,...record});
+        }catch(_){/* Preserve unreadable old copies. */}
       }
-      this.pending = true;
+    }catch(_){/* Folder storage works even when browser storage is disabled. */}
+    for(const record of candidates){
+      try {
+        const local=this.normalize(record.workspace);
+        if(!this.same(this.latest,local)){
+          this.latest=record.revision===state.revision&&!recovered?this.document(local):this.merge(this.latest,local);
+          recovered=true;
+        }
+        this.sources.push({key:record.key,raw:record.raw});this.pending=true;
+      }catch(_){this.notify('An old browser copy could not be imported and was preserved.');}
     }
-    try {
-      const response = await fetch('/api/workspace',{cache:'no-store',signal:AbortSignal.timeout(10000)});
-      if (!response.ok) throw new Error('Disk unavailable');
-      const state = await response.json();
-      const remote = state.workspace ? this.normalize(state.workspace) : null;
-      if (remote) {
-        if (this.pending && this.revision !== state.revision) {
-          this.latest = this.merge(remote,this.latest);
-          recovered = true;
-        } else if (!this.pending) this.latest = this.document(remote);
-      } else if (this.latest.profiles.length) this.pending = true;
-      this.revision = state.revision;
-      this.diskOK = true;
-      if (state.recovered) this.notify('Recovered your workspace from an earlier disk snapshot.');
-    } catch (_) {
-      // Keep pending data and its old revision. Do not replace inaccessible disk data.
-      this.diskOK = false;
-      if (this.latest.profiles.length) this.pending = true;
-      this.notify('Disk saving is unavailable. Your browser recovery copy is being kept; saving will retry automatically.');
+    if(state.recovered)this.notify('Your folder data was restored from an earlier disk snapshot.');
+    if(this.pending){
+      for(let attempt=0;attempt<4&&this.pending;attempt++){
+        await this.flush();
+        if(!this.diskOK)break;
+      }
+      if(this.pending)throw new Error('Browser data has not yet been saved to the local directory. Keep this page open, restart the server, and retry.');
+      this.notify('Existing browser data was moved to the local directory.');
     }
-    if (unreadable) this.notify('Some browser data could not be read. Existing copies were preserved; disk and pending copies were used where available.');
-    if (recovered) this.notify('Interrupted or conflicting edits were recovered. Different versions are kept as separate profiles.');
-    this.cache();
-    if (this.pending) this.schedule(0);
-    this.retry = setInterval(()=>{if(this.pending)this.schedule(0);},5000);
+    this.report();
+    this.retry=setInterval(()=>{if(this.pending)this.schedule(0);},3000);
     window.addEventListener('online',()=>this.schedule(0));
-    window.addEventListener('pagehide',()=>{if(this.pending){this.cache();this.flush();}});
-    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden' && this.pending)this.flush();});
+    window.addEventListener('pagehide',()=>{if(this.pending)this.flush();});
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&this.pending)this.flush();});
     return this.latest;
   }
-
   save(value) {
-    this.latest = this.document(value);
-    this.generation++;
-    this.pending = true;
-    this.cache();
-    this.schedule(250);
-    return this.browserOK;
+    this.latest=this.document(value);this.generation++;this.pending=true;this.report();
+    // Start the disk request on the input event; serialize later edits behind it.
+    this.flush();
+    return false; // The asynchronous disk acknowledgement controls the saved state.
   }
-
   schedule(delay) {
-    if (this.timer !== null || this.running || !this.pending) return;
-    this.timer = setTimeout(()=>{this.timer=null;this.flush();},delay);
+    if(this.timer!==null||this.running||!this.pending)return;
+    this.timer=setTimeout(()=>{this.timer=null;this.flush();},delay);
   }
-
   async flush() {
-    if (this.running || !this.pending) return;
-    this.running = true;
-    const generation = this.generation;
-    const body = JSON.stringify({workspace:this.latest,baseRevision:this.revision});
+    if(this.running||!this.pending)return;
+    this.running=true;
+    const generation=this.generation;
+    const body=JSON.stringify({workspace:this.latest,baseRevision:this.revision});
     try {
-      const response = await fetch('/api/workspace',{
-        method:'POST',headers:{'Content-Type':'application/json'},body,
-        keepalive:new Blob([body]).size < 60000,signal:AbortSignal.timeout(20000),
-      });
-      if (response.status===409) {
-        const state = await response.json();
-        const merged = this.merge(this.normalize(state.workspace),this.latest);
-        this.latest = merged;
-        this.revision = state.revision;
-        this.generation++;
-        this.diskOK = true;
-        this.cache();
-        this.onRecovered(merged);
-        this.notify('Another session saved changes. Both versions were preserved; recovered edits are in separate profiles.');
-      } else {
-        if (!response.ok) throw new Error('Save was not acknowledged');
-        const state = await response.json();
-        this.revision = state.revision;
-        this.diskOK = true;
-        this.pending = generation !== this.generation;
-        this.cache();
-        if (!this.pending) {
-          for (const {key,raw} of this.recoveredKeys) {
-            try {
-              // A live tab may have updated its pending copy since startup.
-              if (localStorage.getItem(key)===raw) localStorage.removeItem(key);
-            } catch (_) { /* Safe to retain. */ }
+      const response=await fetch('/api/workspace',{method:'POST',headers:{'Content-Type':'application/json'},body,
+        keepalive:new Blob([body]).size<60000,signal:AbortSignal.timeout(20000)});
+      if(response.status===409){
+        const state=await response.json();
+        this.latest=this.merge(this.normalize(state.workspace),this.latest);
+        this.revision=state.revision;this.generation++;this.diskOK=true;
+        this.onRecovered(this.latest);
+        this.notify('Another session saved changes. Both versions were kept as separate profiles.');
+      }else{
+        if(!response.ok)throw new Error('Disk save failed');
+        const state=await response.json();
+        this.revision=state.revision;this.diskOK=true;
+        this.pending=generation!==this.generation;
+        if(state.folderCopy===false)this.notify('The database is saved, but the readable JSON copy could not be refreshed. Check folder permissions.');
+        if(!this.pending){
+          for(const {key,raw} of this.sources){
+            try{if(localStorage.getItem(key)===raw)localStorage.removeItem(key);}catch(_){/* Already saved on disk. */}
           }
-          this.recoveredKeys = [];
+          this.sources=[];
         }
       }
-    } catch (_) {
-      this.diskOK = false;
-      this.report();
-    } finally {
-      this.running = false;
-      if (this.pending) this.schedule(this.diskOK ? 0 : 3000);
+    }catch(_){this.diskOK=false;}
+    finally{
+      this.running=false;this.report();
+      if(this.pending)this.schedule(this.diskOK?0:3000);
     }
   }
 }
-if (typeof module !== 'undefined') module.exports = {FolioPersistence};
+if(typeof module!=='undefined')module.exports={FolioPersistence};

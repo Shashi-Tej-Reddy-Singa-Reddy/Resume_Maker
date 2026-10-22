@@ -275,6 +275,7 @@ if __name__ == '__main__':
         print('PORT must be a number between 1 and 65535.', file=sys.stderr)
         sys.exit(1)
     try:
+        workspace_store()
         server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
